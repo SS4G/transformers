@@ -134,9 +134,9 @@ class GPT2Attention(nn.Module):
         )
         self.register_buffer("masked_bias", torch.tensor(-1e4), persistent=False)
 
-        self.embed_dim = config.hidden_size
+        self.embed_dim = config.hidden_size # 这里的hidden_size 应该是乘上了head的个数的
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
+        self.head_dim = self.embed_dim // self.num_heads # * 每个head占用
         self.split_size = self.embed_dim
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
@@ -153,9 +153,15 @@ class GPT2Attention(nn.Module):
         self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
 
         if self.is_cross_attention:
+
             self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
             self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
-        else:
+        else: # ! GPT2 应该没有cross attention 
+            # ? 这里为什么是Conv1D? self.c_attn 是qkv的W矩阵?
+            # * out=β input+α (mat1_i@mat2_i) 
+            # * 这里的c_attn 应该就是 计算QKV的W权重 
+            # * input.size = (b, s, h)
+            # * output.size = (b, s, 3h)
             self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
 
@@ -179,6 +185,7 @@ class GPT2Attention(nn.Module):
         self.num_heads = self.num_heads - len(heads)
         self.pruned_heads = self.pruned_heads.union(heads)
 
+    # * 计算QKV attn的过程
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
@@ -275,6 +282,8 @@ class GPT2Attention(nn.Module):
         """
         Splits hidden_size dim into attn_head_size and num_heads
         """
+        # new_shape = (batch, seq_length, num_heads, attn_head_size)
+        # head_features == attn_head_size 对应head占用多少emb
         new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
         tensor = tensor.view(new_shape)
         return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
@@ -283,6 +292,7 @@ class GPT2Attention(nn.Module):
         """
         Merges attn_head_size dim and num_attn_heads dim into hidden_size
         """
+        # * 变换回 (batch, seq_length, num_heads, attn_head_size)
         tensor = tensor.permute(0, 2, 1, 3).contiguous()
         new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
         return tensor.view(new_shape)
@@ -309,14 +319,18 @@ class GPT2Attention(nn.Module):
             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
         else:
+            # * 这里是GPT encoder_hidden_states 确实是none
+            # * hidden_states.size = (b, s, h) 乘上变换矩阵并split 后 qkv.size =  (b, s, h)
             query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim)
-
+        
+        # ! kv cache 精华部分
         if layer_past is not None:
             past_key, past_value = layer_past
+            # * 看起来这里kv cache是在一直增长的 每次把新增的一行的key 在seq这个维度上添加到尾部 
             key = torch.cat((past_key, key), dim=-2)
             value = torch.cat((past_value, value), dim=-2)
 
@@ -330,15 +344,15 @@ class GPT2Attention(nn.Module):
         else:
             attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
-        attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
-        attn_output = self.c_proj(attn_output)
+        attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim) # * 仅仅做了shape变换
+        attn_output = self.c_proj(attn_output) # * 合并多头attention
         attn_output = self.resid_dropout(attn_output)
 
         outputs = (attn_output, present)
         if output_attentions:
             outputs += (attn_weights,)
 
-        return outputs  # a, present, (attentions)
+        return outputs  # a, present[K,V], (attentions)
 
 
 class GPT2MLP(nn.Module):
@@ -396,9 +410,9 @@ class GPT2Block(nn.Module):
             output_attentions=output_attentions,
         )
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
-        outputs = attn_outputs[1:]
+        outputs = attn_outputs[1:] # present[K, V]
         # residual connection
-        hidden_states = attn_output + residual
+        hidden_states = attn_output + residual # ? GPT2的特殊结构
 
         if encoder_hidden_states is not None:
             # add one self-attention block for cross-attention
@@ -423,13 +437,13 @@ class GPT2Block(nn.Module):
             outputs = outputs + cross_attn_outputs[2:]  # add cross attentions if we output attention weights
 
         residual = hidden_states
-        hidden_states = self.ln_2(hidden_states)
+        hidden_states = self.ln_2(hidden_states) # ? 这里为什么是两个结构
         feed_forward_hidden_states = self.mlp(hidden_states)
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
 
         if use_cache:
-            outputs = (hidden_states,) + outputs
+            outputs = (hidden_states,) + outputs # 输出hidden_state 和 当前的KV 矩阵
         else:
             outputs = (hidden_states,) + outputs[1:]
 
@@ -671,12 +685,18 @@ class GPT2Model(GPT2PreTrainedModel):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
-
+        
+        # * id 映射成emebdding
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
+
+        # * 位置emebdding
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
+
+        # * GPT 堆叠层
         self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
+        # 
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         # Model parallel
@@ -840,6 +860,7 @@ class GPT2Model(GPT2PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
         position_embeds = self.wpe(position_ids)
+        # * 加上pos embedding
         hidden_states = inputs_embeds + position_embeds
 
         if token_type_ids is not None:
@@ -861,6 +882,7 @@ class GPT2Model(GPT2PreTrainedModel):
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
+        # 这里的past_key_values 看其来是每个层都有一个
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             # Model parallel
             if self.model_parallel:
@@ -897,7 +919,7 @@ class GPT2Model(GPT2PreTrainedModel):
             else:
                 outputs = block(
                     hidden_states,
-                    layer_past=layer_past,
+                    layer_past=layer_past, # ! 重点看一下这里的这个kv cache是怎么实现的 这个layer past是seq-element 粒度的
                     attention_mask=attention_mask,
                     head_mask=head_mask[i],
                     encoder_hidden_states=encoder_hidden_states,
@@ -914,9 +936,10 @@ class GPT2Model(GPT2PreTrainedModel):
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
                 if self.config.add_cross_attention:
                     all_cross_attentions = all_cross_attentions + (outputs[3 if use_cache else 2],)
-
+            
+            # ? 这里的模型并行是怎么实现的?
             # Model Parallel: If it's the last layer for that device, put things on the next device
-            if self.model_parallel:
+            if self.model_parallel: # 这看起来是把每个atten kayer 发到了一个 device上面？这是要组成流水线来用吗？
                 for k, v in self.device_map.items():
                     if i == v[-1] and "cuda:" + str(k) != self.last_device:
                         hidden_states = hidden_states.to("cuda:" + str(k + 1))
@@ -937,7 +960,7 @@ class GPT2Model(GPT2PreTrainedModel):
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
-            past_key_values=presents,
+            past_key_values=presents, # 这里将kv 返回了回去
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
@@ -956,10 +979,12 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
+        # GPT2 主要的部分
         self.transformer = GPT2Model(config)
+        # * 从embeding 映射到vocab_size 的全连接层
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # Model parallel
+        # Model parallel 
         self.model_parallel = False
         self.device_map = None
 
@@ -1106,7 +1131,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         lm_logits = self.lm_head(hidden_states)
 
         loss = None
-        if labels is not None:
+        if labels is not None: # 这里是训练?
             # move labels to correct device to enable model parallelism
             labels = labels.to(lm_logits.device)
             # Shift so that tokens < n predict n
@@ -1119,7 +1144,8 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
-
+         
+        # 这个返回值实际上就是一个named tuple之类的东西
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
